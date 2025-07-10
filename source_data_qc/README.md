@@ -1,4 +1,4 @@
-# Data Quality Control Script for Well Data
+# Data Quality Script for PetroAI source data
 
 This Python script performs data extraction, validation, and quality control (QC) checks on oil & gas well data. It supports reading from a MySQL database or local files and provides detailed summary reports and optional cleaned outputs for multiple well-related tables.
 
