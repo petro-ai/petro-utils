@@ -1,330 +1,331 @@
 #%%
 #---------------IMPORTS------------------
 import os
+import logging
 import pandas as pd
 import mysql.connector
+from datetime import date
+from pyspark.sql import DataFrame, SparkSession
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 #Petro scripts:
-import RENAME_MAPPING as rm
-import QC_functions as qf
+from . import RENAME_MAPPING as rm
+from .QC_functions import Process, Summarize, Utilities
 
-#import mysql.connector as sql
-#from sqlalchemy import create_engine, text, MetaData, Table, select, func, Column, Integer
-#from sqlalchemy.orm import sessionmaker
-#import time
+__version__ = "2.0.0"
 
-#%%
-#---------------OPTIONS------------------
+class Processor:
+    def __init__(self, credentials, data_source, do_compare, do_drop_duplicates, do_save_cleaned_files, tables_to_check, basin, source_path, target_path, spark=None):
+        self._log = logging.getLogger(__name__)
+        self.credentials = credentials
+        self.data_source = data_source
+        self.do_compare = do_compare
+        self.do_drop_duplicates = do_drop_duplicates
+        self.do_save_cleaned_files = do_save_cleaned_files
+        self.tables_to_check = tables_to_check
+        self.basin = basin
+        self.source_path = source_path
+        self.target_path = target_path
+        self.spark = spark
 
-#Max rows for printing
-#Only use this if using Well, MonProd, Survey, and Lookup
-pd.set_option('display.max_rows', 20000)
+    def execute(self):
+        loader_cls = getattr(Processor, self.data_source)
+        loader = loader_cls()
+        self.df_dict = loader.load_tables(tables_to_check=self.tables_to_check, source_path=self.source_path, credentials=self.credentials, spark=self.spark)
 
-#Compares well ids across well data
-compare = True
+        for table_name, df in self.df_dict.items():
+            self._process_table(table_name, df)
 
-#only deletes if rows are exact duplicates for key cols
-#currently only on monthly prod
-# count rows beofre and after dropping duplicaes
-drop_duplicates = False
+        if self.do_compare:
+            self._compare_ids()
 
-#optionally save clean output files
-save_cleaned_files = False
+    def _target_path(self, table_name):
+        if self.target_path.startswith("/") or self.target_path.startswith("dbfs:/"):
+            return os.path.join(self.target_path, f'{table_name}.csv')
+        else:
+            return f'{self.target_path}{table_name.lower()}'
 
-#Read from database or files
-#data_source = 'files'
-data_source = 'database'
 
-#%%
-# -------------- TABLE SELECTION ---------------
-#Available tables
-'''
-    'Well',
-    'WellLookup',
-    'MonthlyProduction',
-    'WellDirectionalSurveyPoint',
-    'WellExtra',
-    'GridAttributeHeader',
-    'GridAttributeData',
-    'GridStructureHeader',
-    'GridStructureData',
-    'InventoryWells',
-    'MicroseismicEvent',
-    'StressOrientationMeasure',
-    'ReservoirStressWellLogRecord'
-'''
+    def _write_cleaned(self, df, table_name):
+        if not self.do_save_cleaned_files:
+            return
+        target = self._target_path(table_name)
+        if self.data_source in ["files", "database"]:
+            df.to_csv(target, index=False)
+            self._log.info(f"{table_name}: Wrote {len(df):,} rows to CSV at {target}")
+            return
+        elif self.data_source == "databricks":
+            if not self.spark:
+                from pyspark.sql import SparkSession
+                self.spark = SparkSession.getActiveSession()
+                self._log.info("Spark session started")
+            # Convert datetime.date in object columns
+            for col in df.select_dtypes(include='object').columns:
+                if df[col].apply(lambda x: isinstance(x, date)).any():
+                    self._log.info(f"Converting column {col} from datetime.date to datetime64[ns]")
+                    df[col] = pd.to_datetime(df[col], errors='coerce')
+            try:
+                chunk_size = 100_000
+                total_rows = len(df)
+                if total_rows > chunk_size:
+                    self._log.warning(f"{table_name}: DataFrame too large ({total_rows:,} rows). Splitting into chunks of {chunk_size}")
+                    for i in range(0, total_rows, chunk_size):
+                        chunk = df.iloc[i:i+chunk_size]
+                        spark_chunk = self.spark.createDataFrame(chunk)
+                        spark_chunk.write.mode("append").format("delta").saveAsTable(target)
+                        self._log.info(f"{table_name}: Wrote chunk rows {i:,} – {min(i+chunk_size, total_rows):,}")
+                    # Verify total rows after write
+                    final_count = self.spark.table(target).count()
+                    self._log.info(f"{table_name}: Final row count in {target} is {final_count:,}")
+                    if final_count != total_rows:
+                        self._log.warning(f"{table_name}: Row mismatch! Input={total_rows:,}, Written={final_count:,}")
+                else:
+                    spark_df = self.spark.createDataFrame(df)
+                    self._log.info(f"{table_name}: Writing {total_rows:,} rows to Delta table at {target}")
+                    spark_df.write.mode("overwrite").format("delta").saveAsTable(target)
+                    self._log.info(f"{table_name}: Overwrite write complete")
+                    # Verify
+                    final_count = self.spark.table(target).count()
+                    self._log.info(f"{table_name}: Confirmed {final_count:,} rows written to {target}")
+                    if final_count != total_rows:
+                        self._log.warning(f"{table_name}: Row mismatch! Input={total_rows:,}, Written={final_count:,}")
+            except Exception as e:
+                self._log.error(f"{table_name}: Failed during Spark write — {e}")
+        else:
+            raise NotImplementedError(f"Write method not implemented for data_source: {self.data_source}")
 
-tables_to_check = [
-    'Well',
-    'WellLookup',
-    'MonthlyProduction',
-    'WellDirectionalSurveyPoint',
-    'GridAttributeHeader',
-    'GridAttributeData',
-    'GridStructureHeader',
-    'GridStructureData'
-    ]
+    def _process_table(self, table_name, df):
+        self._log.info(f"----------------------{table_name.upper()} INFO-----------------------------")
+        self._log.info(f"list({df.columns})")
 
-print(f'Tables to Check: {tables_to_check}')
+        try:
+            if not hasattr(Process, table_name):
+                self._log.warning(f"Skipping unknown table: {table_name}")
+                return
 
-#%% DB Connection
-host = 'pai-cloud-mysql-prod.cc9ampy7re8z.us-west-2.rds.amazonaws.com'
-user = 'xx'
-password = 'xx'
-port = 3306
+            process_fn = getattr(Process, table_name)
+            summarize_fn = getattr(Summarize, table_name, None)
 
-database = 'xx'
+            df = process_fn(df, do_drop_duplicates=self.do_drop_duplicates)
 
-db_config = {
-    "host": host,
-    "user": user,
-    "password": password,
-    "port" : port,
-    "database": database
-}
+            if table_name in ['Well']:
+                Utilities.date_checker(df, ['completionDate'])
+            elif table_name == 'MonthlyProduction':
+                Utilities.date_checker(df, ['prodDate'])
 
-#%% File Paths
-srce_path = 'C:/Users/XX/'
-save_path = 'C:/Users/XX/'
+            self._write_cleaned(df, table_name)
 
-path_dict = {
-    'Well': srce_path + 'Well.csv',
-    'WellExtra': srce_path + 'WellExtra.csv',
-    'WellLookup': srce_path + 'WellLookup.csv',
-    'MonthlyProduction': srce_path + 'MonthlyProduction.csv',
-    'WellDirectionalSurveyPoint': srce_path + 'WellDirectionalSurveyPoint.csv',
-    'GridStructureData': srce_path + 'GridStructureData.csv',
-    'GridAttributeData': srce_path + 'GridAttributeData.csv',
-    'GridAttributeHeader': srce_path + 'GridAttributeHeader.csv',
-    'GridStructureHeader': srce_path + 'GridStructureHeader.csv',
-    'InventoryWells': srce_path + 'InventoryWells.csv'
-}
+            if summarize_fn:
+                summarize_fn(df)
 
-#%%
-# ------------- READING DATA INTO DF ------------
-df_check = {}
-df_names =[]
+            if table_name == 'GridStructureData':
+                header = self.df_dict.get('GridStructureHeader')
+                if header is None:
+                    self._log.warning("GridStructureHeader is missing. Skipping interval check.")
+                else:
+                    attr_header = self.df_dict.get('GridAttributeHeader')
+                    result1 = Utilities.check_interval_presence_and_count(header, df, 'interval')
+                    result2 = Utilities.check_interval_presence_and_count(header, attr_header, 'interval')
+                    self._log.info(f'Structure header intervals in Structure Data:\n{result1["Intervals present in Target"]}')
+                    self._log.info(f'Structure header intervals NOT in Structure Data:\n{result1["Intervals not present in Target"]}')
+                    self._log.info(f'Structure header intervals in Attribute Header:\n{result2["Intervals present in Target"]}')
+                    self._log.info(f'Structure header intervals NOT in Attribute Header:\n{result2["Intervals not present in Target"]}')
 
-if data_source == 'files':
-    for table_name in tables_to_check:
-        file_path = path_dict[table_name]
-        if file_path:
-            extension = os.path.splitext(file_path)[1] 
-            if extension == '.csv':
-                df_check[table_name] = pd.read_csv(file_path)
-                print(f'{table_name} read as CSV')
-            elif extension == '.xlsx':
-                df_check[table_name] = pd.read_excel(file_path)
-                print(f'{table_name} read as Excel')
-            elif extension == '.tsv':
-                #make sure delimiter slash is backslash 
-                df_check[table_name] = pd.read_csv(file_path, delimiter = '\t')
-                print(f'{table_name} read as TSV')
+            if table_name == 'GridAttributeData':
+                header = self.df_dict.get('GridAttributeHeader')
+                if header is None:
+                    self._log.warning("GridAttributeHeader is missing. Skipping interval check.")
+                else:
+                    result = Utilities.check_interval_presence_and_count(header, df, 'name')
+                    self._log.info(f'Attribute header intervals in Attribute Data:\n{result["Intervals present in Target"]}')
+                    self._log.info(f'Attribute header intervals NOT in Attribute Data:\n{result["Intervals not present in Target"]}')
+
+            if table_name in ['GridAttributeHeader', 'GridAttributeData']:
+                header = self.df_dict.get('GridAttributeHeader')
+                data = self.df_dict.get('GridAttributeData')
+                if header is not None and data is not None:
+                    header_names = set(header['name'].dropna().unique())
+                    data_names = set(data['name'].dropna().unique())
+
+                    missing_in_data = header_names - data_names
+                    missing_in_header = data_names - header_names
+
+                    if missing_in_data:
+                        self._log.warning(
+                            f"'name' values in GridAttributeHeader but missing in GridAttributeData: "
+                            f"{len(missing_in_data)} — {Utilities._truncate_list_for_log(sorted(missing_in_data))}"
+                        )
+                    if missing_in_header:
+                        self._log.warning(
+                            f"'name' values in GridAttributeData but missing in GridAttributeHeader: "
+                            f"{len(missing_in_header)} — {Utilities._truncate_list_for_log(sorted(missing_in_header))}"
+                        )
+
+        except AttributeError as e:
+            if not hasattr(Process, table_name):
+                raise NotImplementedError(f"No handler defined for table: {table_name}") from e
             else:
-                print(f'Unsupported file format {table_name}')
-                continue
-
-            print(f'{table_name} length: {len(df_check[table_name])}')
-            globals()[f'df_{table_name}'] = df_check[table_name]
-            df_names.append(f'df_{table_name}')
-        else:
-            print(f"No file path provided for {table_name}")
-elif data_source == 'database':
-    # Connect to MySQL
-    conn = mysql.connector.connect(**db_config)
-    for table_name in tables_to_check:
-        query = f"SELECT * FROM {table_name}"
-        # Read data into a DataFrame
-        df_check[table_name] = pd.read_sql(query, conn)
-        print(f'{table_name} read from database')
-        print(f'{table_name} length: {len(df_check[table_name])}')
-        globals()[f'df_{table_name}'] = df_check[table_name]
-        df_names.append(f'df_{table_name}')
-    # Close the connection
-    conn.close()
-else:
-    print('Set the data_source parameter')
+                raise
     
-# %%
-# ------------ QC Report ---------------
-if data_source == 'database':
-    print(f'Database: {database}')
+    def _compare_ids(self):
+        well = self.df_dict.get('Well')
+        prod = self.df_dict.get('MonthlyProduction')
+        lookup = self.df_dict.get('WellLookup')
+        survey = self.df_dict.get('WellDirectionalSurveyPoint')
 
-print('')
-print('-------------------Summary--------------')
-print('Unique Well ID Counts by Table:')
+        missing = [k for k, v in zip(
+            ['Well', 'MonthlyProduction', 'WellLookup', 'WellDirectionalSurveyPoint'],
+            [well, prod, lookup, survey]
+        ) if v is None]
 
-data = []
+        if missing:
+            self._log.warning(f"Skipping ID comparison due to missing tables: {missing}")
+            return
 
-for df_name in df_names:
-    if df_name == 'df_Well':        
-        unique_count = df_Well['wellId'].nunique()
-        data.append(('Well', unique_count))
-    if df_name == 'df_WellExtra':
-        unique_count = df_WellExtra['wellId'].nunique()
-        data.append(('Well Extra', unique_count))
-    if df_name == 'df_MonthlyProduction':
-        unique_count = df_MonthlyProduction['wellId'].nunique()
-        data.append(('Monthly Production', unique_count))
-    if df_name == 'df_WellDirectionalSurveyPoint':
-        unique_count = df_WellDirectionalSurveyPoint['wellId'].nunique()
-        data.append(('Survey', unique_count))
-    if df_name == 'df_WellLookup':
-        unique_count = df_WellLookup['wellId'].nunique()
-        data.append(('Well Lookup', unique_count))
+        Utilities.find_unique_ids(well, prod, lookup, survey)
 
-df_summary = pd.DataFrame(data, columns=['Table', 'Count'])
-df_summary['Count'] = df_summary['Count'].apply(lambda x: "{:,}".format(x))
-print(df_summary)
+    class files:
+        def load_tables(self, tables_to_check, source_path, credentials, spark=None):
+            dfs = {}
+            for table in tables_to_check:
+                path = os.path.join(source_path, f"{table}.csv")
+                if os.path.exists(path):
+                    dfs[table] = pd.read_csv(path)
+            return dfs
 
-for df_name in df_names:
+    class database:
+        def load_tables(self, tables_to_check, source_path, credentials, spark=None):
+            conn = mysql.connector.connect(**credentials)
+            dfs = {t: pd.read_sql(f"SELECT * FROM {t}", conn) for t in tables_to_check}
+            conn.close()
+            return dfs
+
+    class databricks:
+        def load_tables(self, tables_to_check, source_path, credentials, spark=None):
+            if not spark:
+                from pyspark.sql import SparkSession
+                spark = SparkSession.getActiveSession()
+            if not spark:
+                raise ValueError("SparkSession is required for loading Databricks tables.")
+            dfs = {}
+            for table in tables_to_check:
+                full_table_name = f"{source_path}{table}"
+                try:
+                    spark_df = spark.sql(f"SELECT * FROM {full_table_name}")
+                    dfs[table] = spark_df.toPandas()
+                except Exception as e:
+                    logging.warning(f"Could not load table {full_table_name}: {e}")
+            return dfs
+
+def main(
+    credentials: dict = {
+        'host': '',
+        'user': '',
+        'password': '',
+        'port': '',
+        'database': ''
+    },
+    data_source: str = 'databricks', # options: databricks, files, database 
+    do_compare: bool = True,
+    do_drop_duplicates: bool = True,
+    do_save_cleaned_files: bool = True,
+    tables_to_check: list = [
+        'Well',
+        'WellLookup',
+        'MonthlyProduction',
+        'WellDirectionalSurveyPoint',
+        'GridAttributeHeader',
+        'GridAttributeData',
+        'GridStructureHeader',
+        'GridStructureData',
+        'InventoryWells'
+    ],
+    basin: str = 'midland', 
+    source_path: str = f'catalog.source_schema.basin_',       
+    #source_path: str = f'C:/Users/{user}/{credentials['database']}/', 
+    target_path: str = f'catalog.target_schema.basin_',      
+    #target_path: str = f'C:/Users/{user}/{credentials['database']}/for-petroai/',
+    spark: SparkSession = None
+) -> int:
+    _log = logging.getLogger(__name__)
+    try:
+        processor = Processor(
+            credentials=credentials,
+            data_source=data_source,
+            do_compare=do_compare,
+            do_drop_duplicates=do_drop_duplicates,
+            do_save_cleaned_files=do_save_cleaned_files,
+            tables_to_check=tables_to_check,
+            basin=basin,
+            source_path=source_path,
+            target_path=target_path,
+            spark=spark,
+        )
+        processor.execute()
+    except Exception as e:
+        _log.exception(e)
+        return 1
+    else:
+        return 0
+
+
+
+if __name__ == "__main__":
     
-    if df_name == 'df_Well':
-        file_path = save_path + 'Well.csv'
-        date_columns = ['completionDate']
-        print('----------------------WELL HEADER INFO-----------------------------')    
-        df_well = globals()[df_name]
-        print(f'Columns for df_well : {list(df_well)}')
-        
-        qf.process_well_data(df_well, file_path, rename_cols=True, save = save_cleaned_files)            
-
-        qf.summarize_well_data(df_well, rm.relevant_columns_well)
-
-        qf.date_checker(df_well,date_columns)        
-        print('')
-
-    if df_name == 'df_WellExtra':
-        file_path = save_path + 'WellExtra.csv'
-        print('----------------------WELL EXTRA INFO-----------------------------')    
-        df_well_extra = globals()[df_name]
-        print(f'Columns for df_well_extra : {list(df_well_extra)}')
-        print('')
-
-    if df_name == 'df_MonthlyProduction':
-        date_columns = ['prodDate']
-        columns_to_check = ['oilCum_bbl', 'gasCum_Mcf', 'waterCum_bbl']
-        file_path = save_path + 'MonthlyProduction.csv'
-        print('------------------MONTHLY PRODUCTION INFO-------------------')
-        df_monProd = globals()[df_name]
-        print(f'Drop duplicates: {drop_duplicates}')
-        if drop_duplicates:
-            df_monProd = df_monProd.drop_duplicates(
-                subset = [
-                'wellId',
-                'prodDate',
-                'oilRate_bblPerDay',
-                'oilVol_bbl',
-                'oilCum_bbl',
-                'gasRate_McfPerDay',
-                'gasVol_Mcf',
-                'gasCum_Mcf',
-                'waterRate_bblPerDay',
-                'waterVol_bbl',
-                'waterCum_bbl'
-            ])
-
-        print(f'Columns for df_monProd : {list(df_monProd)}')
-        
-        qf.process_monProd_data(df_monProd, file_path, rename_cols=True, save = save_cleaned_files)
-        qf.process_production_data(df_monProd,rm.relevant_columns_monProd)
-
-
-        if df_monProd[columns_to_check].isna().all().all():
-            qf.process_cumulative_data
-            print('Cums were inserted manually')
-        else:
-            print("Monthly Production is missing no cums")
-
-        qf.date_checker(df_monProd,date_columns)
-
-        print('')
-
-    if df_name == 'df_WellDirectionalSurveyPoint':
-        df_survey = globals()[df_name]
-        file_path = save_path + 'WellDirectionalSurveyPoint.csv'
-        print('------------------DIRECTIONAL SURVEY INFO-----------------')
-        print(f'Columns for df_survey : {list(df_survey)}')
-
-        qf.process_survey_data(df_survey, file_path, rename_cols=True, save = save_cleaned_files)
-
-        qf.summarize_survey_data(df_survey, rm.relevant_columns_survey)
-
-        print('')
+    parser = argparse.ArgumentParser(description="Run PetroAI source data QC")
     
+    # Credentials
+    parser.add_argument('--host', type=str, default='', help='MySQL host')
+    parser.add_argument('--user', type=str, default='', help='MySQL user')
+    parser.add_argument('--password', type=str, default='', help='MySQL password')
+    parser.add_argument('--port', type=str, default='', help='MySQL port')
+    parser.add_argument('--database', type=str, default='', help='MySQL database name')
 
-    if df_name == 'df_WellLookup':
-        df_lookup = globals()[df_name]
-        file_path = save_path + 'WellLookup.csv'
-        print('-------------------WELL LOOKUP INFO--------------')
-        print(f'Columns for df_lookup : {list(df_lookup)}')
+    # Main options
+    parser.add_argument('--data_source', choices=['databricks', 'files', 'database'], default='files')
+    parser.add_argument('--do_compare', action='store_true', default=True)
+    parser.add_argument('--no_compare', dest='do_compare', action='store_false')
+    parser.add_argument('--do_drop_duplicates', action='store_true', default=True)
+    parser.add_argument('--no_drop_duplicates', dest='do_drop_duplicates', action='store_false')
+    parser.add_argument('--do_save_cleaned_files', action='store_true', default=True)
+    parser.add_argument('--no_save_cleaned_files', dest='do_save_cleaned_files', action='store_false')
 
-        qf.process_lookup_data(df_lookup, file_path, rename_cols=True, save = save_cleaned_files)
+    parser.add_argument('--tables_to_check', type=str,
+                        default='Well,WellLookup,MonthlyProduction,WellDirectionalSurveyPoint,GridAttributeHeader,GridAttributeData,GridStructureHeader,GridStructureData,InventoryWells',
+                        help='Comma-separated list of tables')
 
-        qf.summarize_lookup_data(df_lookup,rm.relevant_columns_lookup)
+    parser.add_argument('--basin', type=str, default='midland')
+    parser.add_argument('--source_path', type=str, default='C:/Users/charles/Downloads/Midland')
+    parser.add_argument('--target_path', type=str, default='C:/Users/charles/Downloads/Midland/for-petroai/')
 
-        print('')
+    args = parser.parse_args()
 
-    if df_name == 'df_GridStructureData':
-        print('---------------------STRUCTURE DATA INFO---------------------')
-        df_GridStructureData = globals()[df_name]
-        file_path = save_path + 'GridStructureData.csv'
-        if  save_cleaned_files:
-            df_GridStructureData.to_csv(file_path,index=False)
-        df_GridStructureHeader = globals()['df_GridStructureHeader']
-        df_GridAttributeHeader = globals()['df_GridAttributeHeader']
+    credentials = {
+        'host': args.host,
+        'user': args.user,
+        'password': args.password,
+        'port': args.port,
+        'database': args.database
+    }
 
-        result = qf.check_interval_presence_and_count(df_GridStructureHeader, df_GridStructureData,'interval')
-        print('Structure header intervals in Structure Data:')
-        print(result['Intervals present in Target'])
-        print('Structure header intervals NOT in Structure Data:')
-        print(result['Intervals not present in Target'])
-        result = qf.check_interval_presence_and_count(df_GridStructureHeader, df_GridAttributeHeader,'interval')
-        print('Structure header intervals in Attribute Header:')
-        print(result['Intervals present in Target'])
-        print('Structure header intervals NOT in Attribute Header:')
-        print(result['Intervals not present in Target'])
-        print('')
+    tables = [t.strip() for t in args.tables_to_check.split(',') if t.strip()]
 
+    # Use Spark session if available
+    from pyspark.sql import SparkSession
+    spark = SparkSession.getActiveSession()
 
-    if df_name == 'df_GridAttributeData':
-        print('----------------GRID DATA INFO------------------')
-        df_GridAttributeData = globals()[df_name]
-        file_path = save_path + 'GridAttributeData.csv'
-        if  save_cleaned_files:
-            df_GridAttributeData.to_csv(file_path,index=False)
-        df_GridAttributeHeader = globals()['df_GridAttributeHeader']
+    result = main(
+        credentials=credentials,
+        data_source=args.data_source,
+        do_compare=args.do_compare,
+        do_drop_duplicates=args.do_drop_duplicates,
+        do_save_cleaned_files=args.do_save_cleaned_files,
+        tables_to_check=tables,
+        basin=args.basin,
+        source_path=args.source_path,
+        target_path=args.target_path,
+        spark=spark
+    )
 
-        result = qf.check_interval_presence_and_count(df_GridAttributeHeader, df_GridAttributeData,'name')
-        print('Attribute header intervals in Attribute Data:')
-        print(result['Intervals present in Target'])
-        print('Attribute header intervals NOT in Attribute Data:')
-        print(result['Intervals not present in Target'])
-    
-    if df_name == 'df_GridAttributeHeader':
-        file_path = save_path + 'GridAttributeHeader.csv'
-        df_attr_header = globals()[df_name]
-        print(f'Columns for df_attr_header : {list(df_attr_header)}')
-        if  save_cleaned_files:
-            df_attr_header.to_csv(file_path, index = False)
-
-    if df_name == 'df_GridStructureHeader':
-        file_path = save_path + 'GridStructureHeader.csv'
-        df_struc_header = globals()[df_name]
-        print(f'Columns for df_struc_header : {list(df_struc_header)}')
-        if  save_cleaned_files:
-            df_struc_header.to_csv(file_path, index = False)
-
-
-    if df_name == 'df_InventoryWells':
-        df_inventory = globals()[df_name]
-        print(f'Columns for df_inventory : {list(df_inventory)}')
-        file_path = save_path + 'InventoryWells.csv'
-        print('-------------------INVENTORY WELLS INFO--------------')
-        qf.process_inventory_data(df_inventory, file_path,rename_cols=True, save = save_cleaned_files)
-    
-if compare:
-    df_well = globals()['df_Well']
-    df_monProd = globals()['df_MonthlyProduction']
-    df_lookup = globals()['df_WellLookup']
-    df_survey = globals()['df_WellDirectionalSurveyPoint']
-    print('-------------------WELL ID CHECK--------------')
-    qf.find_unique_ids(df_well, df_monProd, df_lookup, df_survey)
+    exit(result)
