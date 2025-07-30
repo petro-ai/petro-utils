@@ -135,6 +135,43 @@ db_config = {
 
 ---
 
+
+## 🖥 Command-Line Interface (CLI)
+
+You can also run the PetroAI QC process from the command line using CLI arguments.
+
+### Basic Example
+
+```bash
+python PetroAI_source_data_qc.py \
+  --data_source files \
+  --basin midland \
+  --source_path "C:/Users/charles/Downloads/Midland" \
+  --target_path "C:/Users/charles/Downloads/Midland/for-petroai/" \
+  --tables_to_check "Well,MonthlyProduction,GridAttributeData"
+```
+
+### Available CLI Arguments
+
+| Argument                   | Description                                                                 |
+|----------------------------|-----------------------------------------------------------------------------|
+| `--host`                   | MySQL host                                                                  |
+| `--user`                   | MySQL user                                                                  |
+| `--password`               | MySQL password                                                              |
+| `--port`                   | MySQL port                                                                  |
+| `--database`               | MySQL database name                                                         |
+| `--data_source`            | Source of input data: `databricks`, `files`, or `database`                 |
+| `--do_compare` / `--no_compare` | Toggle comparison of wellId across tables (default: compare is on)        |
+| `--do_drop_duplicates` / `--no_drop_duplicates` | Toggle dropping duplicate records (default: drop is on)     |
+| `--do_save_cleaned_files` / `--no_save_cleaned_files` | Toggle writing cleaned outputs (default: save is on)     |
+| `--tables_to_check`        | Comma-separated list of tables to check (e.g., `"Well,MonthlyProduction"`) |
+| `--basin`                  | Basin name (e.g., `midland`, `delaware`)                                   |
+| `--source_path`            | Path to input directory (for `files` mode)                                 |
+| `--target_path`            | Path to output directory for cleaned data                                  |
+
+> 💡 Arguments provided via CLI will override any defaults in the script. When running in Databricks or via direct function calls, the CLI logic is skipped.
+
+
 ## 📄 License
 
 This project is private or proprietary unless otherwise specified.
